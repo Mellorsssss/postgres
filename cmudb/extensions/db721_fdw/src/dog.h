@@ -30,7 +30,7 @@ extern "C" {
 #include <unistd.h>
 #include <vector>
 
-using json = nlohmann::json;
+using json = nlohmann::ordered_json;
 
 class Dog
 {
@@ -83,6 +83,19 @@ namespace Db721
     RS_OK,
   };
 
+  struct Db721FdwPlanState
+  {
+    List *filenames;
+    List *attrs_sorted;
+    Bitmapset *attrs_used; /* attributes actually used in query */
+    bool use_mmap;
+    bool use_threads;
+    int32 max_open_files;
+    bool files_in_order;
+    // List *rowgroups; /* List of Lists (per filename) */
+    // uint64 matched_rows;
+  };
+
   class Db721Reader
   {
   private:
@@ -91,7 +104,13 @@ namespace Db721
       int column_num_;
       int maxvalue_block_;
       int num_block_; // for this project, all the column have the same number of blocks
+      std::string table_name_;
       // TODO: num_block_ can be dangerous in the scenario different block have different block value numbers
+
+      void dump()
+      {
+        elog(LOG, "table %s's meta data: %d columns, maxvalue per block is %d, has %d blocks in total", table_name_.c_str(), column_num_, maxvalue_block_, num_block_);
+      }
     } meta_info;
 
     enum DataType
@@ -102,6 +121,7 @@ namespace Db721
     };
 
     static inline std::map<std::string, DataType> type_map = {{"float", DataType::FLOAT}, {"int", DataType::INT}, {"str", DataType::VARCHAR}};
+    static inline std::map<std::string, int> type_size = {{"float", 4}, {"int", 4}, {"str", 32}};
 
     enum Status
     {
@@ -113,12 +133,18 @@ namespace Db721
     {
       DataType column_type;
       int start_offset;
+      int type_size;
       std::string column_name;
       std::vector<int> block_size; // invariant: block_size.size() == meta_info_.num_block_
 
       void dump()
       {
-        elog(LOG, "column: %s, start offset: %d, type: %d, block num: %d", column_name.c_str(), start_offset, static_cast<int>(column_type), static_cast<int>(block_size.size()));
+        elog(LOG, "column: %s, start offset: %d, type: %d(%d bytes), block num: %d", column_name.c_str(), start_offset, static_cast<int>(column_type), type_size, static_cast<int>(block_size.size()));
+
+        for (size_t ind = 0; ind < block_size.size(); ++ind)
+        {
+          elog(LOG, "column: %s block %ld-th's size is %d", column_name.c_str(), ind, block_size[ind]);
+        }
       }
     } column_info;
 
@@ -133,7 +159,24 @@ namespace Db721
   public:
     void Init();
 
+    void Reset()
+    {
+      total_row_ = 0;
+      row_ = 0;
+      cur_block_idx_ = 0;
+      column_data_.resize(meta_info_.column_num_, nullptr);
+    }
+
     void Debug() const;
+
+    /* ReadNextRow */
+    ReadStatus ReadNextRow(TupleTableSlot *slot);
+
+    int RowNumber() const
+    {
+      // TODO: this is just an approximation
+      return meta_info_.num_block_ * meta_info_.maxvalue_block_;
+    }
 
   private:
     /* ReadColumn fetch all column data */
@@ -142,17 +185,17 @@ namespace Db721
     /* ReadNextBlock fetch all the blocks into memory according to the schema*/
     ReadStatus ReadNextBlockBatch();
 
-    /* ReadNextRow */
-    ReadStatus ReadNextRow(TupleTableSlot *slot);
-
-    Status GetColumnOffset(int col_idx, int block_idx);
+    Status GetColumnOffset(int col_idx, int block_idx, int &offset);
 
   private:
     std::unique_ptr<FileReader> reader_;
-    std::vector<void *> column_data_; // current batch of column data
+
+    /* current batch of column data, duckdb treat every data as DataChunk
+       for simplicity, just use void* here */
+    std::vector<void *> column_data_;
 
     /* meta data */
-    json meta_;
+    json meta_; // cache this, maybe we should drop it?
     meta_info meta_info_{.column_num_ = 0, .maxvalue_block_ = 0, .num_block_ = 0};
 
     /* map column name to column index */
@@ -163,5 +206,6 @@ namespace Db721
     /* read state */
     int total_row_{0}; // total row number of current in-memory(column_data_) block
     int row_{0};       // invariant: row_  <= total_row_
+    int cur_block_idx_{0};
   };
 }
