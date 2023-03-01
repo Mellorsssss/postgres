@@ -40,13 +40,12 @@ namespace Db721
     reader_->Read(file_size - 4, 4, &meta_size);
     elog(LOG, "the meta size of the file is %d", meta_size);
 
-    char *buf = static_cast<char *>(palloc0(meta_size + 1));
+    char *buf = static_cast<char *>(this->allocator_->fast_alloc(meta_size + 1));
 
     reader_->Read(file_size - 4 - meta_size, meta_size, static_cast<void *>(buf));
     buf[meta_size] = '\0';
 
     json meta = json::parse(buf);
-    std::cout << meta << std::endl;
 
     pfree(static_cast<void *>(buf));
   }
@@ -59,16 +58,12 @@ namespace Db721
     reader_->Read(file_size - 4, 4, &meta_size);
     elog(LOG, "the meta size of the file is %d", meta_size);
 
-    char *buf = static_cast<char *>(palloc0(meta_size + 1));
+    char *buf = static_cast<char *>(this->allocator_->fast_alloc(meta_size + 1));
 
     reader_->Read(file_size - 4 - meta_size, meta_size, static_cast<void *>(buf));
     buf[meta_size] = '\0';
 
     meta_ = std::move(json::parse(buf));
-
-    pfree(static_cast<void *>(buf));
-
-    std::cout << meta_ << std::endl;
 
     // maintain the basic information
     meta_info_.maxvalue_block_ = meta_["Max Values Per Block"];
@@ -118,6 +113,17 @@ namespace Db721
 
     meta_info_.dump();
     Reset();
+
+    column_data_.resize(meta_info_.column_num_, nullptr);
+    for (int col_idx = 0; col_idx < meta_info_.column_num_; col_idx++)
+    {
+      if (column_data_[col_idx] == nullptr)
+      {
+        // allocate the size of maximun possible chunk size
+        column_data_[col_idx] = allocator_->fast_alloc(meta_info_.maxvalue_block_ * column_type_[col_idx].type_size);
+      }
+    }
+
     elog(LOG, "Db721 of init success");
   }
 
@@ -133,12 +139,6 @@ namespace Db721
     if (s != Status::SUCCESS)
     {
       elog(ERROR, "fail to get the column(%d, %d) offset", col_idx, cur_block_idx_);
-    }
-
-    if (column_data_[col_idx] == nullptr)
-    {
-      // allocate the size of maximun possible chunk size
-      column_data_[col_idx] = palloc0(meta_info_.maxvalue_block_ * column_type_[col_idx].type_size);
     }
 
     int read_size = column_type_[col_idx].block_size[cur_block_idx_] * column_type_[col_idx].type_size;
@@ -195,31 +195,47 @@ namespace Db721
     // TODO: put all the rows into the slot(order?)
 
     // simulate the row
-    std::cout << row_ << "| ";
-    int vi;
-    float vf;
-    char *vc;
-    for (int col_idx = 0; col_idx < meta_info_.column_num_; ++col_idx)
+    for (int col_idx = 0; col_idx < slot->tts_tupleDescriptor->natts; ++col_idx)
     {
+      if (col_idx >= meta_info_.column_num_)
+      {
+        break;
+      }
+
       switch (column_type_[col_idx].column_type)
       {
       case DataType::INT:
-        vi = ((int *)(column_data_[col_idx]))[row_];
-        std::cout << vi << " | ";
+      {
+        int vi = ((int *)(column_data_[col_idx]))[row_];
+        slot->tts_values[col_idx] = Int32GetDatum(vi);
         break;
+      }
       case DataType::FLOAT:
-        vf = ((float *)(column_data_[col_idx]))[row_];
-        std::cout << vf << " | ";
+      {
+        float vf = ((float *)(column_data_[col_idx]))[row_];
+        slot->tts_values[col_idx] = Float4GetDatum(vf);
         break;
+      }
       case DataType::VARCHAR:
-        vc = ((char *)(column_data_[col_idx])) + 32 * row_;
-        std::cout << vc << " | ";
+      {
+        char *vc = &((char *)(column_data_[col_idx]))[32 * row_];
+        slot->tts_values[col_idx] = PointerGetDatum(vc);
+        int varcharlen = strlen(vc);
+
+        /* Build bytea */
+        int64 bytea_len = varcharlen + VARHDRSZ;
+        bytea *b = (bytea *)this->allocator_->fast_alloc(bytea_len);
+        SET_VARSIZE(b, bytea_len);
+        memcpy(VARDATA(b), vc, varcharlen);
+
+        slot->tts_values[col_idx] = PointerGetDatum(b);
         break;
+      }
       default:
         elog(ERROR, "unexpected datatype");
       }
+      slot->tts_isnull[col_idx] = false;
     }
-    std::cout << "\n";
     ++row_;
 
     return ReadStatus::RS_OK;
@@ -235,5 +251,33 @@ namespace Db721
     // hack: we assume all the block has the block size as the maxvalue_block except last one
     offset = block_idx * meta_info_.maxvalue_block_ * column_type_[col_idx].type_size + column_type_[col_idx].start_offset;
     return Status::SUCCESS;
+  }
+
+  Db721ExecutionState *CreateDb721ExecutionState(const std::string &filename, MemoryContext ctx)
+  {
+    return new NaiveExecutionState(filename, ctx);
+  }
+
+  void *
+  exc_palloc(std::size_t size)
+  {
+    /* duplicates MemoryContextAllocZero to avoid increased overhead */
+    void *ret;
+    MemoryContext context = CurrentMemoryContext;
+
+    AssertArg(MemoryContextIsValid(context));
+
+    if (!AllocSizeIsValid(size))
+      throw std::bad_alloc();
+
+    context->isReset = false;
+
+    ret = context->methods->alloc(context, size);
+    if (unlikely(ret == NULL))
+      throw std::bad_alloc();
+
+    VALGRIND_MEMPOOL_ALLOC(context, ret, size);
+
+    return ret;
   }
 }

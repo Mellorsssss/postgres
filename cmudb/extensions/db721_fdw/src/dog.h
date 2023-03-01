@@ -4,6 +4,8 @@
 extern "C" {
 #include "../../../../src/include/postgres.h"
 #include "executor/tuptable.h"
+#include "utils/memutils.h"
+#include "utils/memdebug.h"
 }
 // TODO(WAN): Hack.
 //  Because PostgreSQL tries to be portable, it makes a bunch of global
@@ -22,8 +24,10 @@ extern "C" {
 #undef ngettext
 #undef dngettext
 // clang-format on
+#define SEGMENT_SIZE (1024 * 1024)
 
 #include <fcntl.h>
+#include <list>
 #include <nlohmann/json.hpp>
 #include <string>
 #include <sys/stat.h>
@@ -92,8 +96,128 @@ namespace Db721
     bool use_threads;
     int32 max_open_files;
     bool files_in_order;
+    std::string table_name;
     // List *rowgroups; /* List of Lists (per filename) */
     // uint64 matched_rows;
+  };
+
+  /*
+   * exc_palloc
+   *      C++ specific memory allocator that utilizes postgres allocation sets.
+   */
+  void *
+  exc_palloc(std::size_t size);
+
+  class FastAllocator
+  {
+  private:
+    /*
+     * Special memory segment to speed up bytea/Text allocations.
+     */
+    MemoryContext segments_cxt;
+    char *segment_start_ptr;
+    char *segment_cur_ptr;
+    char *segment_last_ptr;
+    std::list<char *> garbage_segments;
+
+  public:
+    FastAllocator(MemoryContext cxt)
+        : segments_cxt(cxt), segment_start_ptr(nullptr), segment_cur_ptr(nullptr),
+          segment_last_ptr(nullptr), garbage_segments()
+    {
+    }
+
+    ~FastAllocator()
+    {
+      this->recycle();
+    }
+
+    /*
+     * fast_alloc
+     *      Preallocate a big memory segment and distribute blocks from it. When
+     *      segment is exhausted it is added to garbage_segments list and freed
+     *      on the next executor's iteration. If requested size is bigger that
+     *      SEGMENT_SIZE then just palloc is used.
+     */
+    inline void *fast_alloc(long size)
+    {
+      void *ret;
+
+      Assert(size >= 0);
+
+      /* If allocation is bigger than segment then just palloc */
+      if (size > SEGMENT_SIZE)
+      {
+        MemoryContext oldcxt = MemoryContextSwitchTo(this->segments_cxt);
+        void *block = exc_palloc(size);
+        this->garbage_segments.push_back((char *)block);
+        MemoryContextSwitchTo(oldcxt);
+
+        return block;
+      }
+
+      size = MAXALIGN(size);
+
+      /* If there is not enough space in current segment create a new one */
+      if (this->segment_last_ptr - this->segment_cur_ptr < size)
+      {
+        MemoryContext oldcxt;
+
+        /*
+         * Recycle the last segment at the next iteration (if there
+         * was one)
+         */
+        if (this->segment_start_ptr)
+          this->garbage_segments.push_back(this->segment_start_ptr);
+
+        oldcxt = MemoryContextSwitchTo(this->segments_cxt);
+        this->segment_start_ptr = (char *)exc_palloc(SEGMENT_SIZE);
+        this->segment_cur_ptr = this->segment_start_ptr;
+        this->segment_last_ptr =
+            this->segment_start_ptr + SEGMENT_SIZE - 1;
+        MemoryContextSwitchTo(oldcxt);
+      }
+
+      ret = (void *)this->segment_cur_ptr;
+      this->segment_cur_ptr += size;
+
+      return ret;
+    }
+
+    void recycle(void)
+    {
+      /* recycle old segments if any */
+      if (!this->garbage_segments.empty())
+      {
+        bool error = false;
+
+        PG_TRY();
+        {
+          for (auto it : this->garbage_segments)
+          {
+            pfree(it);
+          }
+        }
+        PG_CATCH();
+        {
+          error = true;
+        }
+        PG_END_TRY();
+        if (error)
+        {
+          elog(ERROR, "fail to recycle the files");
+          throw std::runtime_error("garbage segments recycle failed");
+        }
+
+        this->garbage_segments.clear();
+        elog(DEBUG1, "parquet_fdw: garbage segments recycled");
+      }
+    }
+
+    MemoryContext context()
+    {
+      return segments_cxt;
+    }
   };
 
   class Db721Reader
@@ -149,7 +273,7 @@ namespace Db721
     } column_info;
 
   public:
-    Db721Reader(std::string file_name) : reader_(std::make_unique<FileReader>(file_name))
+    Db721Reader(std::string file_name, MemoryContext ctx) : reader_(std::make_unique<FileReader>(file_name)), allocator_(std::make_unique<FastAllocator>(ctx))
     {
     }
     Db721Reader(const Db721Reader &) = delete;
@@ -164,7 +288,8 @@ namespace Db721
       total_row_ = 0;
       row_ = 0;
       cur_block_idx_ = 0;
-      column_data_.resize(meta_info_.column_num_, nullptr);
+      // TODO: consider memory safety
+      // column_data_.resize(meta_info_.column_num_, nullptr);
     }
 
     void Debug() const;
@@ -189,6 +314,7 @@ namespace Db721
 
   private:
     std::unique_ptr<FileReader> reader_;
+    std::unique_ptr<FastAllocator> allocator_;
 
     /* current batch of column data, duckdb treat every data as DataChunk
        for simplicity, just use void* here */
@@ -208,4 +334,56 @@ namespace Db721
     int row_{0};       // invariant: row_  <= total_row_
     int cur_block_idx_{0};
   };
+
+  class Db721ExecutionState
+  {
+  public:
+    Db721ExecutionState() = default;
+    Db721ExecutionState(const Db721ExecutionState &) = delete;
+    Db721ExecutionState &operator=(const Db721ExecutionState &) = delete;
+    virtual ~Db721ExecutionState() = default;
+
+  public:
+    virtual void Next(TupleTableSlot *slot) = 0;
+    virtual void Reset() = 0;
+  };
+
+  class NaiveExecutionState final : public Db721ExecutionState
+  {
+  public:
+    NaiveExecutionState(std::string filename, MemoryContext ctx) : reader_(std::make_unique<Db721Reader>(filename, ctx))
+    {
+      reader_->Init();
+    }
+
+    NaiveExecutionState() = default;
+    ~NaiveExecutionState()
+    {
+      elog(LOG, "NaiveExecution state is destructed");
+    };
+
+  public:
+    void Next(TupleTableSlot *slot) override
+    {
+      if (ReadStatus::RS_OK != reader_->ReadNextRow(slot))
+      {
+        // slot = NULL;
+        elog(LOG, "no more rows");
+      }
+      else
+      {
+        ExecStoreVirtualTuple(slot);
+      }
+    }
+
+    void Reset()
+    {
+      reader_->Reset();
+    }
+
+  private:
+    std::unique_ptr<Db721Reader> reader_;
+  };
+
+  Db721ExecutionState *CreateDb721ExecutionState(const std::string &filename, MemoryContext ctx);
 }
