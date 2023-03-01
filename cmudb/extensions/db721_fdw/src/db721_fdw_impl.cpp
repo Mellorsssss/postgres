@@ -13,6 +13,7 @@ extern "C" {
 #include "commands/defrem.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/planmain.h"
+#include "optimizer/restrictinfo.h"
 }
 // clang-format on
 
@@ -182,12 +183,12 @@ extern "C" void db721_GetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
     filename = std::string(strVal(lfirst(lc)));
   }
 
-  // std::unique_ptr<Db721::Db721Reader> db721reader = std::make_unique<Db721::Db721Reader>(filename, CurrentMemoryContext);
-  // db721reader->Init();
+  std::unique_ptr<Db721::Db721Reader> db721reader = std::make_unique<Db721::Db721Reader>(filename, CurrentMemoryContext);
+  db721reader->Init();
 
   // TODO: we only return the total row number
-  // baserel->rows = static_cast<double>(db721reader->RowNumber());
-  // baserel->tuples = static_cast<double>(db721reader->RowNumber());
+  baserel->rows = static_cast<double>(db721reader->RowNumber());
+  baserel->tuples = static_cast<double>(db721reader->RowNumber());
   baserel->fdw_private = static_cast<void *>(fdwplanstate);
 }
 
@@ -219,6 +220,7 @@ db721_GetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
   Db721::Db721FdwPlanState *fdw_private = reinterpret_cast<Db721::Db721FdwPlanState *>(best_path->fdw_private);
   Index scan_relid = baserel->relid;
   List *params = NIL;
+  scan_clauses = extract_actual_clauses(scan_clauses, false);
 
   params = lappend(params, fdw_private->filenames);
   params = lappend(params, makeInteger(fdw_private->use_mmap));
@@ -299,12 +301,10 @@ extern "C" TupleTableSlot *db721_IterateForeignScan(ForeignScanState *node)
 
 extern "C" void db721_ReScanForeignScan(ForeignScanState *node)
 {
-  elog(LOG, "db721_ReScanForeignScan");
   Db721::Db721ExecutionState *estate = reinterpret_cast<Db721::Db721ExecutionState *>(node->fdw_state);
   estate->Reset();
 }
 
 extern "C" void db721_EndForeignScan(ForeignScanState *node)
 {
-  elog(LOG, "db721_EndForeignScan");
 }
