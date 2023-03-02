@@ -71,6 +71,7 @@ namespace Db721
 
     // metadata["Columns"]["Column Name"] -> column data(json)
     auto &columns = meta_["Columns"];
+    int col_idx = 0;
     for (auto &column : columns.items())
     {
       elog(LOG, "current column is %s", column.key().c_str());
@@ -84,7 +85,16 @@ namespace Db721
         elog(ERROR, "undefined type %s", column.value()["type"]);
       }
 
-      column_info col_info;
+      if (attrs_.find(col_idx) == attrs_.end())
+      {
+        attr_used_.emplace_back(-1);
+      }
+      else
+      {
+        attr_used_.emplace_back(0);
+      }
+
+      column_info col_info{};
       col_info.column_type = type_map[column.value()["type"]];
       col_info.type_size = type_size[column.value()["type"]];
       col_info.column_name = column.key();
@@ -109,6 +119,8 @@ namespace Db721
       {
         meta_info_.num_block_ = column.value()["num_blocks"];
       }
+
+      col_idx++;
     }
 
     meta_info_.dump();
@@ -117,10 +129,12 @@ namespace Db721
     column_data_.resize(meta_info_.column_num_, nullptr);
     for (int col_idx = 0; col_idx < meta_info_.column_num_; col_idx++)
     {
-      if (column_data_[col_idx] == nullptr)
+      // only allocate memory for used attribute
+      if (column_data_[col_idx] == nullptr && attr_used_[col_idx] != -1)
       {
         // allocate the size of maximun possible chunk size
-        column_data_[col_idx] = allocator_->fast_alloc(meta_info_.maxvalue_block_ * column_type_[col_idx].type_size);
+        // hack: we assume that the first block has the largest block size
+        column_data_[col_idx] = allocator_->fast_alloc(column_type_[col_idx].block_size[0] * column_type_[col_idx].type_size);
       }
     }
 
@@ -144,7 +158,7 @@ namespace Db721
     int read_size = column_type_[col_idx].block_size[cur_block_idx_] * column_type_[col_idx].type_size;
     reader_->Read(offset, read_size, column_data_[col_idx]);
 
-    elog(LOG, "read column %d at %d, total %d bytes", col_idx, offset, read_size);
+    // elog(LOG, "read column %d at %d, total %d bytes", col_idx, offset, read_size);
     return ReadStatus::RS_OK;
   }
 
@@ -157,6 +171,11 @@ namespace Db721
 
     for (int col_idx = 0; col_idx < meta_info_.column_num_; col_idx++)
     {
+      // skip the unused attribute
+      if (attr_used_[col_idx] == -1){
+        continue;
+      }
+
       if (ReadStatus::RS_OK != ReadColumn(col_idx))
       {
         elog(LOG, "fail to read column %d", col_idx);
@@ -184,10 +203,6 @@ namespace Db721
         {
           elog(LOG, "fail to read the next block batch");
         }
-        else
-        {
-          elog(LOG, "no more rows");
-        }
         return s;
       }
     }
@@ -199,9 +214,15 @@ namespace Db721
     {
       if (col_idx >= meta_info_.column_num_)
       {
+        slot->tts_isnull[col_idx] = true;
         break;
       }
 
+      if (attr_used_[col_idx] == -1)
+      {
+
+        continue;
+      }
       switch (column_type_[col_idx].column_type)
       {
       case DataType::INT:
@@ -253,9 +274,9 @@ namespace Db721
     return Status::SUCCESS;
   }
 
-  Db721ExecutionState *CreateDb721ExecutionState(const std::string &filename, MemoryContext ctx)
+  Db721ExecutionState *CreateDb721ExecutionState(const std::string &filename, MemoryContext ctx, std::set<int> attrs)
   {
-    return new NaiveExecutionState(filename, ctx);
+    return new NaiveExecutionState(filename, ctx, attrs);
   }
 
   void *

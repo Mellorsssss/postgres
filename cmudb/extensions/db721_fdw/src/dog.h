@@ -33,6 +33,7 @@ extern "C" {
 #include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
+#include <set>
 
 using json = nlohmann::ordered_json;
 
@@ -273,7 +274,7 @@ namespace Db721
     } column_info;
 
   public:
-    Db721Reader(std::string file_name, MemoryContext ctx) : reader_(std::make_unique<FileReader>(file_name)), allocator_(std::make_unique<FastAllocator>(ctx))
+    Db721Reader(std::string file_name, MemoryContext ctx, std::set<int> attrs) : reader_(std::make_unique<FileReader>(file_name)), allocator_(std::make_unique<FastAllocator>(ctx)), attrs_(std::move(attrs))
     {
     }
     Db721Reader(const Db721Reader &) = delete;
@@ -300,7 +301,7 @@ namespace Db721
     int RowNumber() const
     {
       // TODO: this is just an approximation
-      return meta_info_.num_block_ * meta_info_.maxvalue_block_;
+      return meta_info_.num_block_ * column_type_[0].block_size[0];
     }
 
   private:
@@ -327,7 +328,9 @@ namespace Db721
     /* map column name to column index */
     std::map<std::string, int> column_index_;
 
+    std::vector<int> attr_used_;
     std::vector<column_info> column_type_;
+    std::set<int> attrs_; // attributes used
 
     /* read state */
     int total_row_{0}; // total row number of current in-memory(column_data_) block
@@ -351,7 +354,7 @@ namespace Db721
   class NaiveExecutionState final : public Db721ExecutionState
   {
   public:
-    NaiveExecutionState(std::string filename, MemoryContext ctx) : reader_(std::make_unique<Db721Reader>(filename, ctx))
+    NaiveExecutionState(std::string filename, MemoryContext ctx, std::set<int> attrs) : reader_(std::make_unique<Db721Reader>(filename, ctx, attrs))
     {
       reader_->Init();
     }
@@ -365,12 +368,7 @@ namespace Db721
   public:
     void Next(TupleTableSlot *slot) override
     {
-      if (ReadStatus::RS_OK != reader_->ReadNextRow(slot))
-      {
-        // slot = NULL;
-        elog(LOG, "no more rows");
-      }
-      else
+      if (ReadStatus::RS_OK == reader_->ReadNextRow(slot))
       {
         ExecStoreVirtualTuple(slot);
       }
@@ -385,5 +383,5 @@ namespace Db721
     std::unique_ptr<Db721Reader> reader_;
   };
 
-  Db721ExecutionState *CreateDb721ExecutionState(const std::string &filename, MemoryContext ctx);
+  Db721ExecutionState *CreateDb721ExecutionState(const std::string &filename, MemoryContext ctx, std::set<int> attrs);
 }

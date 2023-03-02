@@ -3,6 +3,7 @@
 
 #include "dog.h"
 #include <iostream>
+#include <set>
 
 // clang-format off
 extern "C" {
@@ -14,6 +15,7 @@ extern "C" {
 #include "optimizer/pathnode.h"
 #include "optimizer/planmain.h"
 #include "optimizer/restrictinfo.h"
+#include "optimizer/optimizer.h"
 }
 // clang-format on
 
@@ -102,6 +104,7 @@ namespace Db721_utils
     fdw_private->use_threads = false;
     fdw_private->max_open_files = 0;
     fdw_private->files_in_order = false;
+    fdw_private->attrs_used = NULL;
     table = GetForeignTable(foreigntableid);
 
     foreach (lc, table->options)
@@ -165,6 +168,33 @@ namespace Db721_utils
       // fdw_private->filenames = get_filenames_from_userfunc(funcname, funcarg);
     }
   }
+
+  // modified from parquet_impl.cpp/extract_used_attributes
+  static void
+  extract_used_attributes(RelOptInfo *baserel)
+  {
+    Db721::Db721FdwPlanState *fdw_private = reinterpret_cast<Db721::Db721FdwPlanState *>(baserel->fdw_private);
+    ListCell *lc;
+
+    pull_varattnos((Node *)baserel->reltarget->exprs,
+                   baserel->relid,
+                   &fdw_private->attrs_used);
+
+    foreach (lc, baserel->baserestrictinfo)
+    {
+      RestrictInfo *rinfo = (RestrictInfo *)lfirst(lc);
+
+      pull_varattnos((Node *)rinfo->clause,
+                     baserel->relid,
+                     &fdw_private->attrs_used);
+    }
+
+    if (bms_is_empty(fdw_private->attrs_used))
+    {
+      bms_free(fdw_private->attrs_used);
+      fdw_private->attrs_used = bms_make_singleton(1 - FirstLowInvalidHeapAttributeNumber);
+    }
+  }
 }
 
 extern "C" void db721_GetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
@@ -172,7 +202,7 @@ extern "C" void db721_GetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 {
   elog(LOG, "db721_GetForeignRelSize\n");
 
-  Db721::Db721FdwPlanState *fdwplanstate = (Db721::Db721FdwPlanState *)palloc(sizeof(Db721::Db721FdwPlanState));
+  Db721::Db721FdwPlanState *fdwplanstate = (Db721::Db721FdwPlanState *)palloc0(sizeof(Db721::Db721FdwPlanState));
   Db721_utils::init_fdwplan_state(foreigntableid, fdwplanstate);
 
   // there should only be one .db721 file
@@ -183,7 +213,7 @@ extern "C" void db721_GetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
     filename = std::string(strVal(lfirst(lc)));
   }
 
-  std::unique_ptr<Db721::Db721Reader> db721reader = std::make_unique<Db721::Db721Reader>(filename, CurrentMemoryContext);
+  std::unique_ptr<Db721::Db721Reader> db721reader = std::make_unique<Db721::Db721Reader>(filename, CurrentMemoryContext, std::set<int>({}));
   db721reader->Init();
 
   // TODO: we only return the total row number
@@ -196,6 +226,9 @@ extern "C" void db721_GetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
                                       Oid foreigntableid)
 {
   elog(LOG, "db721_GetForeignPaths\n");
+
+  // get the used attributes for projection push down
+  Db721_utils::extract_used_attributes(baserel);
 
   Cost dummy_cost = 0.0;
   auto foreign_path = (Path *)create_foreignscan_path(root, baserel,
@@ -219,10 +252,20 @@ db721_GetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
   elog(LOG, "db721_GetForeignPlan\n");
   Db721::Db721FdwPlanState *fdw_private = reinterpret_cast<Db721::Db721FdwPlanState *>(best_path->fdw_private);
   Index scan_relid = baserel->relid;
-  List *params = NIL;
+
   scan_clauses = extract_actual_clauses(scan_clauses, false);
 
+  List *attrs_used = NIL;
+  int attr = -1;
+  while ((attr = bms_next_member(fdw_private->attrs_used, attr)) >= 0)
+  {
+    attrs_used = lappend_int(attrs_used, attr);
+    elog(LOG, "push %d to column list", attr);
+  }
+
+  List *params = NIL;
   params = lappend(params, fdw_private->filenames);
+  params = lappend(params, attrs_used);
   params = lappend(params, makeInteger(fdw_private->use_mmap));
   params = lappend(params, makeInteger(fdw_private->use_threads));
   params = lappend(params, makeInteger(fdw_private->max_open_files));
@@ -253,6 +296,8 @@ extern "C" void db721_BeginForeignScan(ForeignScanState *node, int eflags)
   List *fdw_private = plan->fdw_private;
   ListCell *lc;
   List *filenames = NIL;
+  List *attrs_used = NIL;
+  std::set<int> attrs;
 
   int i = 0;
   foreach (lc, fdw_private)
@@ -262,6 +307,16 @@ extern "C" void db721_BeginForeignScan(ForeignScanState *node, int eflags)
     case 0:
       filenames = (List *)lfirst(lc);
       break;
+    case 1:
+    {
+      ListCell *lc2;
+      attrs_used = (List *)lfirst(lc);
+      foreach (lc2, attrs_used)
+      {
+        attrs.insert(lfirst_int(lc2) - (1 - FirstLowInvalidHeapAttributeNumber));
+      }
+      break;
+    }
     default:
       elog(LOG, "not supported now for %d-th option", i);
     }
@@ -281,7 +336,7 @@ extern "C" void db721_BeginForeignScan(ForeignScanState *node, int eflags)
   MemoryContext ctx = estate->es_query_cxt;
   MemoryContext reader_ctx = AllocSetContextCreateInternal(ctx, "db721 reader", ALLOCSET_DEFAULT_SIZES);
 
-  Db721::Db721ExecutionState *fdwestate = Db721::CreateDb721ExecutionState(filename, reader_ctx);
+  Db721::Db721ExecutionState *fdwestate = Db721::CreateDb721ExecutionState(filename, reader_ctx, attrs);
   node->fdw_state = reinterpret_cast<void *>(fdwestate);
 
   MemoryContextCallback *callback = (MemoryContextCallback *)palloc(sizeof(MemoryContextCallback));
